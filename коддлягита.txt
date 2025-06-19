@@ -1,0 +1,282 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import (accuracy_score, f1_score, roc_auc_score,
+                            confusion_matrix, classification_report)
+from xgboost import XGBClassifier
+import matplotlib.pyplot as plt
+import seaborn as sns
+import joblib
+import warnings
+import tkinter as tk
+from tkinter import ttk, messagebox
+
+# Игнорирование предупреждений
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# Настройки отображения
+pd.set_option('display.max_columns', None)
+plt.style.use('seaborn-v0_8')
+sns.set_theme(style="whitegrid", palette="husl")
+
+def load_and_prepare_data(filepath):
+    """Загрузка и подготовка данных из Excel файла"""
+    try:
+        # Загрузка данных с указанием движка
+        data = pd.read_excel(filepath, engine='openpyxl')
+        print("Данные успешно загружены. Размер:", data.shape)
+
+        if 'ID' in data.columns:
+            data = data.drop('ID', axis=1)
+
+        # Проверка наличия целевой переменной
+        if 'Survival' not in data.columns:
+            raise ValueError("Столбец 'Survival' не найден в данных")
+
+        # Замена специальных значений на NaN
+        data = data.replace(['?', 'NA', 'N/A', '', ' '], np.nan)
+
+        # Преобразование целевой переменной
+        if data['Survival'].dtype == 'object':
+            data['Survival'] = data['Survival'].map({'Да': 1, 'Нет': 0, 'Yes': 1, 'No': 0})
+            data['Survival'] = data['Survival'].astype(int)
+
+        return data
+
+    except Exception as e:
+        print(f"Ошибка при загрузке данных: {e}")
+        return None
+
+def get_feature_names(preprocessor):
+    """Функция получения имен признаков"""
+    feature_names = []
+
+    for name, transformer, features in preprocessor.transformers_:
+        if name == 'remainder':
+            continue
+
+        if hasattr(transformer, 'named_steps'):
+            # Для Pipeline
+            if 'onehot' in transformer.named_steps:
+                ohe = transformer.named_steps['onehot']
+                cats = ohe.categories_
+                for i, feature in enumerate(features):
+                    feature_names.extend([f"{feature}_{str(cat)}" for cat in cats[i]])
+            else:
+                feature_names.extend(features)
+        else:
+            feature_names.extend(features)
+
+    return feature_names
+
+class PredictionApp:
+    def __init__(self, root, model_path, preprocessor_path, top_features):
+        self.root = root
+        self.root.title("Прогнозирование выживаемости пациентов")
+
+        self.model = joblib.load(model_path)
+        self.preprocessor = joblib.load(preprocessor_path)
+        self.top_features = top_features
+        self.full_columns = joblib.load('feature_columns.pkl')
+
+        self.create_widgets()
+
+    def create_widgets(self):
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+
+        # Создаем поля ввода для каждого важного признака
+        self.entries = {}
+        for i, feature in enumerate(self.top_features):
+            ttk.Label(main_frame, text=feature).grid(row=i, column=0, sticky=tk.W, pady=2)
+            entry = ttk.Entry(main_frame)
+            entry.grid(row=i, column=1, sticky=(tk.W, tk.E), pady=2, padx=5)
+            self.entries[feature] = entry
+
+        # Кнопка предсказания
+        predict_btn = ttk.Button(main_frame, text="Сделать прогноз", command=self.predict)
+        predict_btn.grid(row=len(self.top_features)+1, column=0, columnspan=2, pady=10)
+
+        # Область для вывода результатов
+        self.result_label = ttk.Label(main_frame, text="", font=('Arial', 10))
+        self.result_label.grid(row=len(self.top_features)+2, column=0, columnspan=2)
+
+    def predict(self):
+        try:
+            patient_data = {}
+            for col in self.top_features:
+                value = self.entries[col].get()
+                if value == "":
+                    patient_data[col] = np.nan
+                else:
+                    try:
+                        patient_data[col] = float(value) if '.' in value else int(value)
+                    except ValueError:
+                        patient_data[col] = value
+
+            # Создаем полный набор данных с NaN для отсутствующих признаков
+            full_data = {col: np.nan for col in self.full_columns}
+            full_data.update(patient_data)
+            input_df = pd.DataFrame([full_data])
+
+            # Предобработка и предсказание
+            processed_data = self.preprocessor.transform(input_df)
+            proba = self.model.predict_proba(processed_data)[0][1]
+            prediction = self.model.predict(processed_data)[0]
+
+            result_text = (f"Результат предсказания:\n"
+                         f"Вероятность выживания: {proba:.2%}\n"
+                         f"Прогноз: {'Выживет' if prediction == 1 else 'Не выживет'}")
+
+            self.result_label.config(text=result_text)
+
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Произошла ошибка: {str(e)}")
+
+def main():
+    filepath = r"C:\Users\Юлианна\Desktop\база мед данных\basewithmed.xlsx"
+
+    # 1. Загрузка и подготовка данных
+    print("Загрузка данных...")
+    data = load_and_prepare_data(filepath)
+    if data is None:
+        return
+
+    # 2. Разделение данных
+    X = data.drop('Survival', axis=1)
+    y = data['Survival'].astype(int)
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y)
+
+    # 3. Создание препроцессора
+    numeric_features = X.select_dtypes(include=['int64', 'float64']).columns
+    categorical_features = X.select_dtypes(include=['object']).columns
+
+    numeric_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='median')),
+        ('scaler', StandardScaler())])
+
+    categorical_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='most_frequent')),
+        ('onehot', OneHotEncoder(handle_unknown='ignore', sparse=False))])
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('num', numeric_transformer, numeric_features),
+            ('cat', categorical_transformer, categorical_features)],
+        remainder='drop')
+
+    # 4. Преобразование данных
+    print("\nПреобразование признаков...")
+    X_train_processed = preprocessor.fit_transform(X_train)
+    X_test_processed = preprocessor.transform(X_test)
+
+    # Получаем имена признаков
+    try:
+        feature_names = preprocessor.get_feature_names_out()
+    except AttributeError:
+        feature_names = get_feature_names(preprocessor)
+
+    feature_names = [name.replace('num__', '').replace('cat__', '') for name in feature_names]
+    print("\nПервые 10 признаков после преобразования:", feature_names[:10])
+
+    # 5. Обучение модели
+    print("\nОбучение модели XGBoost...")
+    scale_pos_weight = np.sum(y_train == 0) / np.sum(y_train == 1)
+
+    model = XGBClassifier(
+        objective='binary:logistic',
+        n_estimators=300,
+        max_depth=5,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_alpha=1.0,
+        reg_lambda=1.0,
+        scale_pos_weight=scale_pos_weight,
+        early_stopping_rounds=20,
+        eval_metric=['auc', 'logloss'],
+        random_state=42,
+        n_jobs=-1
+    )
+
+    model.fit(
+        X_train_processed, y_train,
+        eval_set=[(X_test_processed, y_test)],
+        verbose=True
+    )
+
+    # 6. Оценка модели
+    print("\nОценка модели:")
+    y_pred = model.predict(X_test_processed)
+    y_pred_proba = model.predict_proba(X_test_processed)[:, 1]
+
+    print(f"Accuracy: {accuracy_score(y_test, y_pred):.4f}")
+    print(f"F1-score: {f1_score(y_test, y_pred):.4f}")
+    print(f"ROC-AUC: {roc_auc_score(y_test, y_pred_proba):.4f}")
+
+    # 7. Визуализация важности признаков
+    if len(feature_names) == X_train_processed.shape[1]:
+        importance = pd.DataFrame({
+            'Feature': feature_names,
+            'Importance': model.feature_importances_
+        }).sort_values('Importance', ascending=False)
+
+        top_20_features = importance.head(20)
+        print("\nТоп-20 важных признаков:")
+        print(top_20_features)
+
+        plt.figure(figsize=(12, 8))
+        sns.barplot(x='Importance', y='Feature', data=top_20_features, palette='viridis')
+        plt.title('Топ-20 важных признаков')
+        plt.tight_layout()
+        plt.show()
+
+        original_top_features = []
+        for feature in top_20_features['Feature']:
+            if '_' in feature:
+                original_feature = feature.split('_')[0]
+                if original_feature not in original_top_features:
+                    original_top_features.append(original_feature)
+            else:
+                if feature not in original_top_features:
+                    original_top_features.append(feature)
+
+        original_top_features = list(set(original_top_features))
+        print("\nИсходные названия топ-признаков:", original_top_features)
+
+    else:
+        print(f"Ошибка: количество имен признаков ({len(feature_names)}) не совпадает с данными ({X_train_processed.shape[1]})")
+        return
+
+    # 8. Сохранение модели и данных
+    print("\nСохранение модели...")
+    joblib.dump(model, 'xgboost_survival_model.pkl')
+    joblib.dump(preprocessor, 'preprocessor.pkl')
+    joblib.dump(X_train.columns.tolist(), 'feature_columns.pkl')
+    print("Модель, препроцессор и список признаков сохранены")
+
+    # 9. Запуск GUI для предсказания
+    while True:
+        answer = input("\nХотите сделать предсказание для нового пациента? (да/нет): ").lower()
+        if answer == 'да':
+            root = tk.Tk()
+            app = PredictionApp(root,
+                               'xgboost_survival_model.pkl',
+                               'preprocessor.pkl',
+                               original_top_features)
+            root.mainloop()
+        elif answer == 'нет':
+            print("Работа программы завершена.")
+            break
+        else:
+            print("Пожалуйста, введите 'да' или 'нет'")
+
+if __name__ == "__main__":
+    main()
